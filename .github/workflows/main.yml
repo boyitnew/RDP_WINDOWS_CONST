@@ -32,7 +32,7 @@ jobs:
       - name: Create RDP User with Fixed Password
         run: |
           # Set your fixed password here
-          $password = "13691369"
+          $password = "*r96319631P-"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
