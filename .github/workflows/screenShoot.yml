@@ -1,0 +1,177 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to open in Chrome (include https://). Default: https://google.com'
+        required: false
+        default: 'https://google.com'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
+
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+        shell: powershell
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          # Set your fixed password here
+          $password = "*r96319631P-"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # create user if not exists
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          } else {
+            Write-Host "Local user 'RDP' already exists"
+          }
+
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+        shell: powershell
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+        shell: powershell
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+        shell: powershell
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+        shell: powershell
+
+      # ----------------- NEW: launch Chrome & take screenshot -----------------
+      - name: Wait 10 seconds then launch Chrome (UI)
+        env:
+          TARGET_URL: ${{ github.event.inputs.url }}
+        run: |
+          Write-Host "Waiting 10 seconds before launching Chrome..."
+          Start-Sleep -Seconds 10
+
+          $url = $env:TARGET_URL
+          if (-not $url) { $url = "https://google.com" }
+
+          $chromePaths = @(
+            "C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+          )
+          $chrome = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $chrome) {
+            Write-Error "Chrome executable not found. Aborting screenshot step."
+            exit 1
+          }
+
+          Write-Host "Launching Chrome UI with URL: $url"
+          Start-Process -FilePath $chrome -ArgumentList $url
+        shell: powershell
+
+      - name: Wait 5 seconds and take fullscreen screenshot (saves artifact)
+        run: |
+          Write-Host "Waiting 5 seconds for page to finish loading..."
+          Start-Sleep -Seconds 5
+
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "Screen bounds: $($bounds.Width) x $($bounds.Height)"
+
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+
+          $userPath = "$env:USERPROFILE\screenshot.png"
+          $workspacePath = Join-Path $env:GITHUB_WORKSPACE "screenshot.png"
+
+          $bmp.Save($userPath, [System.Drawing.Imaging.ImageFormat]::Png)
+          Copy-Item -Path $userPath -Destination $workspacePath -Force
+
+          Write-Host "Screenshot saved to: $userPath"
+          Write-Host "Also copied to workspace: $workspacePath"
+        shell: powershell
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-screenshot
+          path: screenshot.png
+        shell: powershell
+      # ----------------- END NEW STEPS -----------------
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
+        shell: powershell
