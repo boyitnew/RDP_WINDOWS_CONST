@@ -117,7 +117,7 @@ jobs:
           if (-not $script:chrome) { throw "Google Chrome not found after install." }
           echo "CHROME_PATH=$script:chrome" >> $env:GITHUB_ENV
 
-      - name: Launch Chrome (non-headless) with DevTools
+      - name: Launch Chrome (normal window)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -126,78 +126,69 @@ jobs:
           $profileDir = "$env:TEMP\chrome-profile"
           if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
           $args = @(
-            "--remote-debugging-port=9222",
             "--user-data-dir=$profileDir",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-gpu",
             "--start-maximized",
             "--new-window",
             $env:TARGET_URL
           )
           Start-Process -FilePath $chrome -ArgumentList $args | Out-Null
 
-          # Wait for DevTools endpoint to become available
-          $ok = $false
-          for ($i=0; $i -lt 30; $i++) {
-            try {
-              Invoke-WebRequest -Uri "http://127.0.0.1:9222/json/version" -UseBasicParsing | Out-Null
-              $ok = $true; break
-            } catch { Start-Sleep -Seconds 1 }
-          }
-          if (-not $ok) { throw "Chrome DevTools endpoint didn't come up" }
-
-      - name: Capture screenshot via Chrome DevTools (non-headless)
+      - name: Capture two desktop screenshots (pre/post 10s)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          npm --version
-          npm init -y | Out-Null
-          npm i --save-exact chrome-remote-interface@0.33.0
-          @'
-          import CDP from "chrome-remote-interface";
-          import fs from "fs";
 
-          async function main() {
-            const url = process.env.TARGET_URL || "https://www.coinpayu.com/login";
-            // Create new tab in existing Chrome instance
-            const browser = await CDP({ host: "127.0.0.1", port: 9222 });
-            const { Target } = browser;
-            const { targetId } = await Target.createTarget({ url: "about:blank" });
-            const client = await CDP({ host: "127.0.0.1", port: 9222, target: targetId });
-            const { Page, Emulation } = client;
-            await Page.enable();
-            await Emulation.setDeviceMetricsOverride({ width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
-            await Page.navigate({ url });
-            await Page.loadEventFired();
-            await new Promise(r => setTimeout(r, 50000));
-            const { data } = await Page.captureScreenshot({ format: "png", fromSurface: true });
-            fs.writeFileSync("screenshot.png", Buffer.from(data, "base64"));
-            await client.close();
-            await browser.close();
+          function Take-Screen($Path) {
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
           }
 
-          main().catch(err => { console.error(err); process.exit(1); });
-          '@ | Set-Content -Path "screenshot.mjs" -Encoding UTF8
+          # First shot shortly after open
+          Start-Sleep -Seconds 5
+          $shot1 = Join-Path $PWD 'screenshot_1.png'
+          Take-Screen -Path $shot1
+          if (!(Test-Path $shot1)) { throw "First screenshot not created" }
+          echo "SCREENSHOT1_PATH=$shot1" >> $env:GITHUB_ENV
 
-          node ".\screenshot.mjs"
-          if (!(Test-Path "screenshot.png")) { throw "Screenshot not created" }
-          echo "SCREENSHOT_PATH=$(Resolve-Path .\screenshot.png)" >> $env:GITHUB_ENV
+          # Click Cloudflare captcha checkbox
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(300, 400)
+          $signature = '[DllImport("user32.dll",CharSet=CharSet.Auto,CallingConvention=CallingConvention.StdCall)] public static extern void mouse_event(long dwFlags, long dx, long dy, long cButtons, long dwExtraInfo);'
+          $SendMouseClick = Add-Type -MemberDefinition $signature -Name "Win32MouseEventNew" -Namespace Win32Functions -PassThru
+          $SendMouseClick::mouse_event(0x02, 0, 0, 0, 0)
+          $SendMouseClick::mouse_event(0x04, 0, 0, 0, 0)
 
-      - name: Upload screenshot artifact
+          # Second shot 10s later
+          Start-Sleep -Seconds 10
+          $shot2 = Join-Path $PWD 'screenshot_2.png'
+          Take-Screen -Path $shot2
+          if (!(Test-Path $shot2)) { throw "Second screenshot not created" }
+          echo "SCREENSHOT2_PATH=$shot2" >> $env:GITHUB_ENV
+
+      - name: Upload screenshots artifact
         uses: actions/upload-artifact@v4
         with:
-          name: timeir-screenshot
-          path: screenshot.png
+          name: timeir-screenshots
+          path: |
+            screenshot_1.png
+            screenshot_2.png
           retention-days: 7
           if-no-files-found: error
 
-      - name: Log screenshot download page
+      - name: Log screenshots download page
         shell: pwsh
         run: |
           Write-Host "Target URL: $env:TARGET_URL"
-          Write-Host "Screenshot saved at: $env:SCREENSHOT_PATH"
-          Write-Host "Download from the run page (Artifacts -> timeir-screenshot):"
+          Write-Host "Screenshot #1: $env:SCREENSHOT1_PATH"
+          Write-Host "Screenshot #2: $env:SCREENSHOT2_PATH"
+          Write-Host "Download from the run page (Artifacts -> timeir-screenshots):"
           Write-Host "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Maintain Connection
