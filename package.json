@@ -2,7 +2,7 @@
   "name": "chrome-cdp-screenshot",
   "version": "1.0.0",
   "description": "Take screenshot and title from a page using Chrome CDP",
-  "main": "scripts/run-cdp-windows.js",
+  "main": "run-cdp-windows.js",
   "dependencies": {
     "chrome-remote-interface": "^0.32.0"
   }
