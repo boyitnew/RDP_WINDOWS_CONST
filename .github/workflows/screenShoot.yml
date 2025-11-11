@@ -1,4 +1,4 @@
-name: RDP screenshoot
+name: RDP screenshot
 
 on:
   workflow_dispatch:
@@ -86,38 +86,95 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Open Google Chrome and take screenshot (headless)
+      - name: Download PsExec
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $url = "https://download.sysinternals.com/files/PSTools.zip"
+          $zip = "$env:TEMP\PSTools.zip"
+          $dir = "$env:TEMP\PSTools"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $psexec = Join-Path $dir "PsExec.exe"
+          if (!(Test-Path $psexec)) { throw "PsExec not found" }
+          echo "PSEXEC=$psexec" >> $env:GITHUB_ENV
 
-          # Locate Google Chrome
+      - name: Launch Chrome in active RDP session (visible)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $psexec = $env:PSEXEC
+          if (-not $psexec) { throw "PSEXEC env not set" }
+
+          # Locate or install Google Chrome
           $chromeCandidates = @(
             "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
             "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
             "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
           )
           $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $chrome) { throw "Google Chrome not found on this runner." }
+          if (-not $chrome) {
+            Write-Host "Chrome not found, installing..."
+            $msiUrl = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
+            $msiPath = "$env:TEMP\chrome.msi"
+            Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart" -Wait
+            $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $chrome) { throw "Google Chrome not found after install." }
 
-          $screenshot = "screenshot-timeir.png"
-          # Use Chrome's native headless mode to wait ~10s and capture a screenshot
-          & $chrome `
-            --headless=new `
-            --disable-gpu `
-            --window-size=1366,768 `
-            --virtual-time-budget=10000 `
-            --screenshot="$PWD\$screenshot" `
-            "https://www.coinpayu.com/login" | Write-Output
+          # Wait for an active RDP session and get its ID
+          $sessionId = $null
+          $timeoutSec = 600
+          $deadline = (Get-Date).AddSeconds($timeoutSec)
+          while (-not $sessionId -and (Get-Date) -lt $deadline) {
+            $out = (qwinsta 2>$null) -join "`n"
+            $rx = New-Object System.Text.RegularExpressions.Regex "^\s*\S+\s+(\S+)\s+(\d+)\s+Active", 'Multiline'
+            $ms = $rx.Matches($out)
+            foreach ($m in $ms) {
+              $sessName = $m.Groups[1].Value
+              $id = [int]$m.Groups[2].Value
+              if ($sessName -like "rdp-tcp*") { $sessionId = $id; break }
+            }
+            if (-not $sessionId) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $sessionId) { throw "No active RDP session detected within $timeoutSec seconds." }
 
-          if (!(Test-Path $screenshot)) { throw "Screenshot not created" }
-          echo "SCREENSHOT_PATH=$(Resolve-Path .\$screenshot)" >> $env:GITHUB_ENV
+          # Launch Chrome in that interactive session and open https://www.coinpayu.com/login
+          & $psexec -accepteula -i $sessionId -d `"$chrome`" --new-window "https://https://www.coinpayu.com/login"
+          Start-Sleep -Seconds 10
+          echo "RDP_SESSION_ID=$sessionId" >> $env:GITHUB_ENV
+
+      - name: Capture desktop screenshot from RDP session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $psexec = $env:PSEXEC
+          $shotPath = "C:\Users\Public\screenshot-timeir.png"
+          $tmp = "$env:TEMP\grabshot.ps1"
+          @'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bmp.Save("C:\Users\Public\screenshot-timeir.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          '@ | Set-Content -Path $tmp -Encoding UTF8
+
+          & $psexec -accepteula -i $env:RDP_SESSION_ID -d powershell -NoProfile -ExecutionPolicy Bypass -File `"$tmp`"
+
+          $retries = 0
+          while (-not (Test-Path $shotPath) -and $retries -lt 60) { Start-Sleep -Seconds 1; $retries++ }
+          if (!(Test-Path $shotPath)) { throw "Screenshot not created in RDP session $env:RDP_SESSION_ID" }
+          echo "SCREENSHOT_PATH=$shotPath" >> $env:GITHUB_ENV
 
       - name: Upload screenshot artifact
         uses: actions/upload-artifact@v4
         with:
           name: timeir-screenshot
-          path: screenshot-timeir.png
+          path: C:\Users\Public\screenshot-timeir.png
           retention-days: 7
           if-no-files-found: error
 
