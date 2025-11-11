@@ -1,7 +1,12 @@
-name: RDP screenshot
+name: RDP screenshoot
 
 on:
   workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL to open in Chrome and capture'
+        required: false
+        default: 'https://www.coinpayu.com/login'
 
 jobs:
   secure-rdp:
@@ -86,101 +91,111 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Download PsExec
+      - name: Set target URL
+        shell: pwsh
+        run: |
+          echo "TARGET_URL=${{ inputs.target_url }}" >> $env:GITHUB_ENV
+
+      - name: Ensure Google Chrome
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $url = "https://download.sysinternals.com/files/PSTools.zip"
-          $zip = "$env:TEMP\PSTools.zip"
-          $dir = "$env:TEMP\PSTools"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $psexec = Join-Path $dir "PsExec.exe"
-          if (!(Test-Path $psexec)) { throw "PsExec not found" }
-          echo "PSEXEC=$psexec" >> $env:GITHUB_ENV
-
-      - name: Launch Chrome in active RDP session (visible)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $psexec = $env:PSEXEC
-          if (-not $psexec) { throw "PSEXEC env not set" }
-
-          # Locate or install Google Chrome
           $chromeCandidates = @(
             "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
             "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
             "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
           )
-          $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $chrome) {
+          $script:chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $script:chrome) {
             Write-Host "Chrome not found, installing..."
             $msiUrl = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
             $msiPath = "$env:TEMP\chrome.msi"
             Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
             Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart" -Wait
-            $chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+            $script:chrome = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
           }
-          if (-not $chrome) { throw "Google Chrome not found after install." }
+          if (-not $script:chrome) { throw "Google Chrome not found after install." }
+          echo "CHROME_PATH=$script:chrome" >> $env:GITHUB_ENV
 
-          # Wait for an active RDP session and get its ID
-          $sessionId = $null
-          $timeoutSec = 600
-          $deadline = (Get-Date).AddSeconds($timeoutSec)
-          while (-not $sessionId -and (Get-Date) -lt $deadline) {
-            $out = (qwinsta 2>$null) -join "`n"
-            $rx = New-Object System.Text.RegularExpressions.Regex "^\s*\S+\s+(\S+)\s+(\d+)\s+Active", 'Multiline'
-            $ms = $rx.Matches($out)
-            foreach ($m in $ms) {
-              $sessName = $m.Groups[1].Value
-              $id = [int]$m.Groups[2].Value
-              if ($sessName -like "rdp-tcp*") { $sessionId = $id; break }
-            }
-            if (-not $sessionId) { Start-Sleep -Seconds 5 }
-          }
-          if (-not $sessionId) { throw "No active RDP session detected within $timeoutSec seconds." }
-
-          # Launch Chrome in that interactive session and open https://www.coinpayu.com/login
-          & $psexec -accepteula -i $sessionId -d `"$chrome`" --new-window "https://https://www.coinpayu.com/login"
-          Start-Sleep -Seconds 10
-          echo "RDP_SESSION_ID=$sessionId" >> $env:GITHUB_ENV
-
-      - name: Capture desktop screenshot from RDP session
+      - name: Launch Chrome (non-headless) with DevTools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $psexec = $env:PSEXEC
-          $shotPath = "C:\Users\Public\screenshot-timeir.png"
-          $tmp = "$env:TEMP\grabshot.ps1"
+          $chrome = $env:CHROME_PATH
+          if (-not $chrome) { throw "CHROME_PATH not set" }
+          $profileDir = "$env:TEMP\chrome-profile"
+          if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Force -Path $profileDir | Out-Null }
+          $args = @(
+            "--remote-debugging-port=9222",
+            "--user-data-dir=$profileDir",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-gpu",
+            "--start-maximized",
+            "--new-window",
+            $env:TARGET_URL
+          )
+          Start-Process -FilePath $chrome -ArgumentList $args | Out-Null
+
+          # Wait for DevTools endpoint to become available
+          $ok = $false
+          for ($i=0; $i -lt 30; $i++) {
+            try {
+              Invoke-WebRequest -Uri "http://127.0.0.1:9222/json/version" -UseBasicParsing | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ok) { throw "Chrome DevTools endpoint didn't come up" }
+
+      - name: Capture screenshot via Chrome DevTools (non-headless)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm --version
+          npm init -y | Out-Null
+          npm i --save-exact chrome-remote-interface@0.33.0
           @'
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $bmp.Save("C:\Users\Public\screenshot-timeir.png", [System.Drawing.Imaging.ImageFormat]::Png)
-          '@ | Set-Content -Path $tmp -Encoding UTF8
+          import CDP from "chrome-remote-interface";
+          import fs from "fs";
 
-          & $psexec -accepteula -i $env:RDP_SESSION_ID -d powershell -NoProfile -ExecutionPolicy Bypass -File `"$tmp`"
+          async function main() {
+            const url = process.env.TARGET_URL || "https://www.coinpayu.com/login";
+            // Create new tab in existing Chrome instance
+            const browser = await CDP({ host: "127.0.0.1", port: 9222 });
+            const { Target } = browser;
+            const { targetId } = await Target.createTarget({ url: "about:blank" });
+            const client = await CDP({ host: "127.0.0.1", port: 9222, target: targetId });
+            const { Page, Emulation } = client;
+            await Page.enable();
+            await Emulation.setDeviceMetricsOverride({ width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
+            await Page.navigate({ url });
+            await Page.loadEventFired();
+            await new Promise(r => setTimeout(r, 10000));
+            const { data } = await Page.captureScreenshot({ format: "png", fromSurface: true });
+            fs.writeFileSync("screenshot.png", Buffer.from(data, "base64"));
+            await client.close();
+            await browser.close();
+          }
 
-          $retries = 0
-          while (-not (Test-Path $shotPath) -and $retries -lt 60) { Start-Sleep -Seconds 1; $retries++ }
-          if (!(Test-Path $shotPath)) { throw "Screenshot not created in RDP session $env:RDP_SESSION_ID" }
-          echo "SCREENSHOT_PATH=$shotPath" >> $env:GITHUB_ENV
+          main().catch(err => { console.error(err); process.exit(1); });
+          '@ | Set-Content -Path "screenshot.mjs" -Encoding UTF8
+
+          node ".\screenshot.mjs"
+          if (!(Test-Path "screenshot.png")) { throw "Screenshot not created" }
+          echo "SCREENSHOT_PATH=$(Resolve-Path .\screenshot.png)" >> $env:GITHUB_ENV
 
       - name: Upload screenshot artifact
         uses: actions/upload-artifact@v4
         with:
           name: timeir-screenshot
-          path: C:\Users\Public\screenshot-timeir.png
+          path: screenshot.png
           retention-days: 7
           if-no-files-found: error
 
       - name: Log screenshot download page
         shell: pwsh
         run: |
+          Write-Host "Target URL: $env:TARGET_URL"
           Write-Host "Screenshot saved at: $env:SCREENSHOT_PATH"
           Write-Host "Download from the run page (Artifacts -> timeir-screenshot):"
           Write-Host "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
