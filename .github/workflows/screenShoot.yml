@@ -170,7 +170,7 @@ jobs:
             await Emulation.setDeviceMetricsOverride({ width: 1366, height: 768, deviceScaleFactor: 1, mobile: false });
             await Page.navigate({ url });
             await Page.loadEventFired();
-            await new Promise(r => setTimeout(r, 10000));
+            await new Promise(r => setTimeout(r, 50000));
             const { data } = await Page.captureScreenshot({ format: "png", fromSurface: true });
             fs.writeFileSync("screenshot.png", Buffer.from(data, "base64"));
             await client.close();
