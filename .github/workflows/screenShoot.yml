@@ -103,7 +103,7 @@ jobs:
           Start-Sleep -Seconds 10
 
           # Run Node script to get title and full-page screenshot
-          node .\scripts\run-cdp-windows.js
+          node .\run-cdp-windows.js
 
       - name: Upload Screenshot
         uses: actions/upload-artifact@v4
