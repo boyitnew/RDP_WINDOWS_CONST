@@ -1,11 +1,7 @@
-name: RDP + Chrome Screenshot
+name: RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      target_url:
-        description: 'URL to open in Chrome (include https://)'
-        required: true
 
 jobs:
   secure-rdp:
@@ -23,23 +19,27 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing firewall rule and allow incoming RDP connections
+          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # Restart RDP service to apply changes
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Fixed Password
         run: |
+          # Set your fixed password here
           $password = "*r96319631P-"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
+          
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
@@ -49,13 +49,17 @@ jobs:
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -63,53 +67,65 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
+      
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
           Write-Host "TCP connectivity successful!"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-
-      - name: Install Node dependencies
-        run: npm install
-
-      - name: Start Chrome and Take Screenshot
-        env:
-          TARGET_URL: ${{ github.event.inputs.target_url }}
+      - name: Take screenshot of time.ir (headless)
+        shell: pwsh
         run: |
-          $chromePaths = @(
-            "C:\Program Files\Google\Chrome\Application\chrome.exe",
-            "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-          )
-          $chrome = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $chrome) { Write-Error "Chrome not found"; exit 1 }
+          $ErrorActionPreference = 'Stop'
+          # Initialize minimal Node project and install Playwright locally
+          npm --version
+          npm init -y | Out-Null
+          npm i --save-exact playwright@1.48.2
+          npx playwright install chromium
+          
+          # Create the screenshot script
+          @'
+          import { chromium } from "playwright";
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage({ viewport: { width: 1366, height: 768 } });
+          await page.goto("https://time.ir", { waitUntil: "domcontentloaded", timeout: 120000 });
+          await page.waitForTimeout(10000);
+          await page.screenshot({ path: "screenshot-timeir.png", fullPage: true });
+          await browser.close();
+          console.log("Saved: screenshot-timeir.png");
+          '@ | Set-Content -Path "screenshot.mjs" -Encoding UTF8
+          
+          node ".\screenshot.mjs"
+          if (!(Test-Path "screenshot-timeir.png")) { throw "Screenshot not created" }
+          echo "SCREENSHOT_PATH=$(Resolve-Path .\screenshot-timeir.png)" >> $env:GITHUB_ENV
 
-          $port = 9222
-          $userData = "$env:TEMP\gh_chrome_profile"
-          if (-not (Test-Path $userData)) { New-Item -ItemType Directory -Path $userData | Out-Null }
-
-          $args = "--headless=new --remote-debugging-port=$port --user-data-dir=`"$userData`" --no-first-run --no-default-browser-check --disable-extensions --disable-gpu"
-          Start-Process -FilePath $chrome -ArgumentList $args -PassThru | Out-Null
-
-          Write-Host "Waiting 10 seconds before connecting to Chrome..."
-          Start-Sleep -Seconds 10
-
-          # Run Node script to get title and full-page screenshot
-          node .\run-cdp-windows.js
-
-      - name: Upload Screenshot
+      - name: Upload screenshot artifact
         uses: actions/upload-artifact@v4
         with:
-          name: page-screenshot
-          path: screenshot.png
+          name: timeir-screenshot
+          path: screenshot-timeir.png
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Log screenshot download page
+        shell: pwsh
+        run: |
+          Write-Host "Screenshot saved at: $env:SCREENSHOT_PATH"
+          Write-Host "Download from the run page (Artifacts -> timeir-screenshot):"
+          Write-Host "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Maintain Connection
         run: |
@@ -118,6 +134,8 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
