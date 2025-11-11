@@ -108,7 +108,7 @@ jobs:
             --window-size=1366,768 `
             --virtual-time-budget=10000 `
             --screenshot="$PWD\$screenshot" `
-            "https://time.ir" | Write-Output
+            "https://www.coinpayu.com/login" | Write-Output
 
           if (!(Test-Path $screenshot)) { throw "Screenshot not created" }
           echo "SCREENSHOT_PATH=$(Resolve-Path .\$screenshot)" >> $env:GITHUB_ENV
