@@ -157,13 +157,26 @@ jobs:
           if (!(Test-Path $shot1)) { throw "First screenshot not created" }
           echo "SCREENSHOT1_PATH=$shot1" >> $env:GITHUB_ENV
 
-          # Click Cloudflare captcha checkbox
+          # Scroll down and click Cloudflare captcha
           Add-Type -AssemblyName System.Windows.Forms
-          [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(300, 400)
-          $signature = '[DllImport("user32.dll",CharSet=CharSet.Auto,CallingConvention=CallingConvention.StdCall)] public static extern void mouse_event(long dwFlags, long dx, long dy, long cButtons, long dwExtraInfo);'
-          $SendMouseClick = Add-Type -MemberDefinition $signature -Name "Win32MouseEventNew" -Namespace Win32Functions -PassThru
-          $SendMouseClick::mouse_event(0x02, 0, 0, 0, 0)
-          $SendMouseClick::mouse_event(0x04, 0, 0, 0, 0)
+          
+          # Send Page Down key to scroll
+          [System.Windows.Forms.SendKeys]::SendWait("{PGDN}")
+          Start-Sleep -Seconds 2
+          
+          # Click captcha position (adjust coordinates based on screenshot)
+          $clickX = 512
+          $clickY = 500
+          [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($clickX, $clickY)
+          
+          # Mouse click
+          $signature = @'
+[DllImport("user32.dll",CharSet=CharSet.Auto,CallingConvention=CallingConvention.StdCall)]
+public static extern void mouse_event(long dwFlags, long dx, long dy, long cButtons, long dwExtraInfo);
+'@
+          $SendMouseClick = Add-Type -MemberDefinition $signature -Name "Win32MouseEvent" -Namespace Win32Functions -PassThru
+          $SendMouseClick::mouse_event(0x02, 0, 0, 0, 0)  # Left button down
+          $SendMouseClick::mouse_event(0x04, 0, 0, 0, 0)  # Left button up
 
           # Second shot 10s later
           Start-Sleep -Seconds 10
